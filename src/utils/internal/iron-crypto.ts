@@ -1,91 +1,163 @@
 /**
-Based on https://github.com/brc-dd/iron-webcrypto/tree/v1.2.1
-Copyright (c) 2021 Divyansh Singh.
-https://github.com/brc-dd/iron-webcrypto/blob/v1.2.1/LICENSE.md
-
-Based on https://github.com/hapijs/iron/tree/v7.0.1
-Copyright (c) 2012-2022, Project contributors Copyright (c) 2012-2020, Sideway Inc All rights reserved.
-https://github.com/hapijs/iron/blob/v7.0.1/LICENSE.md
+ * @file src/utils/internal/iron-crypto.ts
+ * @description
+ * 这个文件实现了基于 Iron 协议的加密和解密工具。
+ * Iron 协议设计用于将会话数据或其他 JSON 可序列化对象安全地封装成一个字符串，
+ * 这个字符串既是加密的，也带有完整性校验，防止篡改。
+ * 它通常用于在客户端（例如 cookie）或 URL 中安全地传输状态信息。
+ *
+ * 主要功能:
+ * - `seal`: 将对象 "封印" 成一个安全的字符串。
+ * - `unseal`: 将 "封印" 的字符串 "解封" 回原始对象。
+ *
+ * 实现借鉴了以下项目:
+ * - [iron-webcrypto](https://github.com/brc-dd/iron-webcrypto): 使用 Web Crypto API 实现 Iron 协议。
+ * - [hapijs/iron](https://github.com/hapijs/iron): Node.js 环境下 Iron 协议的原始实现。
+ *
+ * 使用了 `uncrypto` 库来提供跨环境 (Node.js, Deno, Bun, Workers, Browsers) 的 Web Crypto API。
  */
 
-import crypto from "uncrypto"; // Node.js 18 support
-import {
-  base64Decode,
-  base64Encode,
-  textDecoder,
-  textEncoder,
-} from "./encoding";
+// 导入 uncrypto 库，它提供了跨平台的 Web Crypto API
+// 在 Node.js 18 及更早版本，会使用 Node.js 内置的 crypto 模块
+import crypto from "uncrypto";
+import { textDecoder, textEncoder, base64Decode } from "./encoding";
 
-/** The default encryption and integrity settings. */
+/**
+ * @description 默认的加密和完整性校验设置。
+ * 这些是 `seal` 和 `unseal` 函数在未提供特定选项时的默认值。
+ */
 export const defaults: Readonly<SealOptions> = /* @__PURE__ */ Object.freeze({
+  // 默认 TTL (Time To Live) 为 0，表示永不过期。
   ttl: 0,
+  // 允许的时间戳偏差（秒），用于验证 'unseal' 时的过期时间戳，防止因时钟不同步导致验证失败。
   timestampSkewSec: 60,
+  // 本地时间偏移（毫秒），用于调整当前时间戳，以适应服务器时钟可能存在的偏移。
   localtimeOffsetMsec: 0,
+  // 加密相关默认设置
   encryption: /* @__PURE__ */ Object.freeze({
-    saltBits: 256,
-    algorithm: "aes-256-cbc",
-    iterations: 1,
-    minPasswordlength: 32,
+    saltBits: 256, // 盐值位数，用于 PBKDF2 密钥派生
+    algorithm: "aes-256-cbc", // 加密算法 (AES-256-CBC)
+    iterations: 1, // PBKDF2 迭代次数 (注意：官方 iron 库迭代次数也是 1，虽然通常建议更高次数，但为了兼容性保持一致)
+    minPasswordlength: 32, // 最小密码长度要求
+    keyBits: 256, // 密钥位数
+    ivBits: 128, // AES-CBC/CTR 使用 128 位 IV (必需)
   }),
+  // 完整性校验 (HMAC) 相关默认设置
   integrity: /* @__PURE__ */ Object.freeze({
-    saltBits: 256,
-    algorithm: "sha256",
-    iterations: 1,
-    minPasswordlength: 32,
+    saltBits: 256, // 盐值位数
+    algorithm: "sha256", // HMAC 哈希算法 (SHA-256)
+    iterations: 1, // PBKDF2 迭代次数
+    minPasswordlength: 32, // 最小密码长度要求
+    keyBits: 256, // 密钥位数
   }),
 });
 
-/** Configuration of each supported algorithm. */
+/**
+ * @description 支持的加密和哈希算法的配置。
+ * 定义了每种算法所需的密钥位数、IV 位数以及对应的 Web Crypto API 名称。
+ */
 export const algorithms = /* @__PURE__ */ Object.freeze({
+  // AES-128-CTR 配置
   "aes-128-ctr": /* @__PURE__ */ Object.freeze({
-    keyBits: 128,
-    ivBits: 128,
-    name: "AES-CTR",
+    keyBits: 128, // 密钥位数
+    ivBits: 128, // 初始化向量 (IV) 位数
+    name: "AES-CTR", // Web Crypto API 算法名称
   }),
+  // AES-256-CBC 配置
   "aes-256-cbc": /* @__PURE__ */ Object.freeze({
     keyBits: 256,
     ivBits: 128,
     name: "AES-CBC",
   }),
+  // SHA-256 配置 (用于 HMAC)
   sha256: /* @__PURE__ */ Object.freeze({
-    keyBits: 256,
-    ivBits: 128,
-    name: "SHA-256",
+    keyBits: 256, // HMAC 密钥位数
+    ivBits: 128, // 注意：虽然 HMAC 不需要 IV，但这里为了结构统一可能保留了字段
+    name: "SHA-256", // Web Crypto API 哈希算法名称
   }),
 });
 
-/** MAC normalization format version. */
+/**
+ * @description MAC (消息认证码) 规范化格式的版本号。
+ * 用于标识 Iron 协议字符串的格式版本。
+ */
 export const macFormatVersion = "2";
 
-/** MAC normalization prefix. */
+/**
+ * @description MAC 规范化格式的前缀。
+ * `Fe26` 代表铁 (Iron) 的原子序数，`2` 是版本号。
+ * 这个前缀用于快速识别一个字符串是否是有效的 Iron 协议字符串。
+ */
 export const macPrefix = "Fe26.2"; // `Fe26.${macFormatVersion}`
 
-/** Serializes, encrypts, and signs objects into an iron protocol string. */
+/**
+ * @description 将对象序列化、加密并签名，生成一个 Iron 协议字符串 ("封印")。
+ * @param object {Readonly<unknown>} 需要封印的对象 (必须是 JSON 可序列化的)。
+ * @param password {Readonly<RawPassword>} 用于加密和签名的密码。可以是单个密码字符串/Buffer，或包含特定密码的对象。
+ * @param opts {Readonly<SealOptions>} 加密和签名选项，会与 `defaults` 合并。
+ * @returns {Promise<string>} 返回封印后的 Iron 协议字符串。
+ * @throws {Error} 如果密码为空、密码 ID 无效或加密/签名过程中出错。
+ */
 export async function seal(
   object: Readonly<unknown>,
   password: Readonly<RawPassword>,
   opts: Readonly<SealOptions>,
 ): Promise<string> {
+  // 获取当前时间戳，并应用本地时间偏移
   const now = Date.now() + (opts.localtimeOffsetMsec || 0);
 
   if (!password) {
-    throw new Error("Empty password");
+    throw new Error("Empty password"); // 密码不能为空
   }
+  // 规范化密码格式，可能包含加密密码和完整性密码
   const { id = "", encryption, integrity } = normalizePassword(password);
+  // 如果提供了密码 ID，校验其格式 (只能包含字母、数字、下划线)
   if (id && !/^\w+$/.test(id)) {
     throw new Error("Invalid password id");
   }
 
-  // prettier-ignore
-  const { encrypted, key } = await encrypt(encryption, opts.encryption, JSON.stringify(object));
+  // 步骤 1: 加密数据
+  //    - 使用规范化后的加密密码和选项生成加密密钥 (包含盐值和 IV)
+  //    - 将对象序列化为 JSON 字符串
+  //    - 使用生成的密钥加密 JSON 字符串
+  const encryptionKey = await generateKey(encryption, opts.encryption);
+  const integrityKey = await generateKey(integrity, opts.integrity);
 
-  const encryptedB64 = base64Encode(encrypted);
-  const iv = base64Encode(key.iv);
+  // Convert generated bytes to base64url strings for the sealed format
+  const saltB64 = bytesToBase64Url(encryptionKey.salt);
+  if (!encryptionKey.iv) {
+    throw new Error("IV is required for encryption but was not generated or provided.");
+  }
+  const ivB64 = bytesToBase64Url(encryptionKey.iv);
+  const integritySaltB64 = bytesToBase64Url(integrityKey.salt);
+
+  const serialized = JSON.stringify(object);
+  // Pass the raw IV bytes (encryptionKey.iv) to the encrypt function
+  // Encrypt function now returns an object { encrypted: Uint8Array, key: Key }
+  const { encrypted: encryptedBytes } = await encrypt(encryption, opts.encryption, encryptionKey.iv, serialized);
+  const encryptedB64 = bytesToBase64Url(encryptedBytes);
   const expiration = opts.ttl ? now + opts.ttl : "";
-  const macBaseString = `${macPrefix}*${id}*${key.salt}*${iv}*${encryptedB64}*${expiration}`;
 
-  const mac = await hmacWithPassword(integrity, opts.integrity, macBaseString);
-  const sealed = `${macBaseString}*${mac.salt}*${mac.digest}`;
+  // 步骤 2: 生成 MAC (消息认证码) 基础字符串
+  //    格式: prefix*id*encryptionSalt*encryptionIvB64*encryptedDataB64*expiration
+  //    这个字符串包含了所有需要进行完整性校验的信息。
+  const macBaseString = `${macPrefix}*${id}*${saltB64}*${ivB64}*${encryptedB64}*${expiration}*${integritySaltB64}`;
+
+  // Explicitly encode the string to Uint8Array before passing to hmac
+  const macBaseStringBytes = textEncoder.encode(macBaseString);
+  // Use the 'hmacWithPassword' function which generates the key internally
+  // and now returns { digest: string (base64url), salt: Uint8Array }
+  const macResult = await hmacWithPassword(integrity, opts.integrity, macBaseStringBytes as Uint8Array);
+
+  // The digest is already base64url encoded by hmacWithPassword
+  const macDigestB64url = macResult.digest;
+  // Convert the salt returned by hmacWithPassword to base64url
+  const hmacSaltB64url = bytesToBase64Url(macResult.salt);
+
+  // 步骤 4: 组合最终的封印字符串
+  //    格式: macBaseString*hmacSaltB64url*hmacDigestB64url
+  //    将 MAC 基础字符串、HMAC 计算时使用的盐值 (base64url)、以及 HMAC 摘要 (base64url) 组合在一起。
+  const sealed = `${macBaseString}*${hmacSaltB64url}*${macDigestB64url}`;
   return sealed;
 }
 
@@ -106,8 +178,8 @@ export async function unseal(
     throw new Error("Incorrect number of sealed components");
   }
   // prettier-ignore
-  const [prefix, passwordId, encryptionSalt, encryptionIv, encryptedB64, expiration, hmacSalt, hmac] = parts;
-  const macBaseString = `${prefix}*${passwordId}*${encryptionSalt}*${encryptionIv}*${encryptedB64}*${expiration}`;
+  const [prefix, passwordId, encryptionSaltB64, encryptionIvB64, encryptedB64, expiration, hmacSaltB64, hmac] = parts;
+  const macBaseString = `${prefix}*${passwordId}*${encryptionSaltB64}*${encryptionIvB64}*${encryptedB64}*${expiration}*${hmacSaltB64}`;
 
   if (macPrefix !== prefix) {
     throw new Error("Wrong mac prefix");
@@ -136,7 +208,7 @@ export async function unseal(
   pass = normalizePassword(pass);
 
   // prettier-ignore
-  const mac = await hmacWithPassword(pass.integrity, { ...opts.integrity, salt: hmacSalt }, macBaseString);
+  const mac = await hmacWithPassword(pass.integrity, { ...opts.integrity, salt: base64UrlToBytes(hmacSaltB64) }, textEncoder.encode(macBaseString));
 
   if (!fixedTimeComparison(mac.digest, hmac)) {
     throw new Error("Bad hmac value");
@@ -144,10 +216,10 @@ export async function unseal(
 
   const encrypted = base64Decode(encryptedB64);
 
-  const decryptOptions: GenerateKeyOptions<EncryptionAlgorithm> = {
+  const decryptOptions: EncryptionGenerateKeyOptions = {
     ...opts.encryption,
-    salt: encryptionSalt,
-    iv: base64Decode(encryptionIv),
+    salt: base64UrlToBytes(encryptionSaltB64),
+    iv: base64UrlToBytes(encryptionIvB64),
   };
 
   const decrypted = await decrypt(pass.encryption, decryptOptions, encrypted);
@@ -159,131 +231,137 @@ export async function unseal(
 
 /** Calculates a HMAC digest. */
 export async function hmacWithPassword(
-  password: Readonly<Password>,
-  options: Readonly<GenerateKeyOptions<IntegrityAlgorithm>>,
-  data: string,
+  password: Password,
+  options: IntegrityGenerateKeyOptions,
+  data: Uint8Array, // Changed from string | Uint8Array
 ): Promise<HMacResult> {
-  const key = await generateKey(password, { ...options, hmac: true });
-  const textBuffer = textEncoder.encode(data);
+  const key: Key = await generateKey(password, options); // Add explicit : Key type
+  // Directly use the provided Uint8Array data
+  const textBuffer = data;
   // prettier-ignore
   const signed = await crypto.subtle.sign({ name: "HMAC" }, key.key, textBuffer);
-  const digest = base64Encode(new Uint8Array(signed));
-  return { digest, salt: key.salt };
+  // Return base64url encoded digest consistent with the rest of the protocol
+  const digest = bytesToBase64Url(new Uint8Array(signed));
+  // Add explicit cast to salt
+  return { digest, salt: key.salt as Uint8Array };
 }
 
 // --- key generation ---
 
-/** Generates a key from the password. */
-export async function generateKey(
+/**
+ * @description 从密码生成用于加密/解密的密钥材料。
+ * @param password {Password} 密码字符串或 Buffer。
+ * @param options {GenerateKeyOptions<EncryptionAlgorithm | IntegrityAlgorithm>} 生成密钥的选项，包括算法、盐值、IV (仅加密)、迭代次数、最小密码长度和密钥长度。
+ * @returns {Promise<Key>} 返回一个包含密钥 (CryptoKey)、盐值和 IV (仅加密) 的对象。
+ * @throws {Error} 如果密码太短。
+ */
+async function generateKey(
   password: Password,
   options: GenerateKeyOptions,
 ): Promise<Key> {
-  if (!password?.length) {
-    throw new Error("Empty password");
+  // Merge provided options with defaults for the specific algorithm type
+  const baseDefaults = options.algorithm.startsWith('aes') ? defaults.encryption : defaults.integrity;
+  const mergedOptions = { ...baseDefaults, ...options } as EncryptionGenerateKeyOptions | IntegrityGenerateKeyOptions;
+
+  // 检查密码长度是否满足最小要求
+  if (password.length < mergedOptions.minPasswordlength) {
+    throw new Error(`Password must be at least ${mergedOptions.minPasswordlength} characters`);
   }
 
-  if (options == null || typeof options !== "object")
-    throw new Error("Bad options");
-  if (!(options.algorithm in algorithms))
-    throw new Error(`Unknown algorithm: ${options.algorithm}`);
+  // passwordBytes is used below
+  const passwordBytes = typeof password === "string" ? textEncoder.encode(password) : password;
 
-  const algorithm = algorithms[options.algorithm];
+  if (mergedOptions.iterations > 0) { // PBKDF2 derivation
+    const salt = options.salt
+      ? (typeof options.salt === 'string' ? base64UrlToBytes(options.salt) : options.salt)
+      : crypto.getRandomValues(new Uint8Array(options.saltBits / 8));
 
-  let resultKey: Key["key"];
-  let resultSalt: Key["salt"];
-  let resultIV: Key["iv"];
-
-  const hmac = options.hmac ?? false;
-  // prettier-ignore
-  const id = hmac ? { name: "HMAC", hash: algorithm.name } : { name: algorithm.name };
-  const usage: KeyUsage[] = hmac ? ["sign", "verify"] : ["encrypt", "decrypt"];
-
-  if (typeof password === "string") {
-    if (password.length < options.minPasswordlength) {
-      throw new Error(
-        `Password string too short (min ${options.minPasswordlength} characters required)`,
-      );
-    }
-    let { salt = "" } = options;
-    if (!salt) {
-      const { saltBits = 0 } = options;
-      if (!saltBits) throw new Error("Missing salt and saltBits options");
-      const randomSalt = randomBits(saltBits);
-      salt = [...new Uint8Array(randomSalt)]
-        .map((x) => x.toString(16).padStart(2, "0"))
-        .join("");
+    let iv: Uint8Array | undefined;
+    if ('ivBits' in options) { // Type guard should narrow options type here
+      iv = options.iv || crypto.getRandomValues(new Uint8Array(options.ivBits / 8));
     }
 
-    // prettier-ignore
-    const derivedKey = await pbkdf2(password, salt, options.iterations, algorithm.keyBits / 8, "SHA-1");
-    // prettier-ignore
-    const importedEncryptionKey = await crypto.subtle.importKey("raw", derivedKey, id, false, usage);
-    resultKey = importedEncryptionKey;
-    resultSalt = salt;
+    const baseKey = await crypto.subtle.importKey(
+      "raw",
+      passwordBytes,
+      { name: "PBKDF2" },
+      false,
+      ["deriveBits"],
+    );
+
+    const derivedKeyBytes = await crypto.subtle.deriveBits(
+      {
+        name: "PBKDF2",
+        salt,
+        iterations: options.iterations,
+        hash: "SHA-256",
+      },
+      baseKey,
+      options.keyBits,
+    );
+
+    const hmac = options.algorithm.startsWith("sha");
+    const id = hmac ? { name: "HMAC", hash: "SHA-256" } : { name: options.algorithm.toUpperCase().replace(/-(\d+)/, "-$1") };
+    const usage: KeyUsage[] = hmac ? ["sign", "verify"] : ["encrypt", "decrypt"];
+
+    const key = await crypto.subtle.importKey(
+      "raw",
+      derivedKeyBytes,
+      id,
+      false,
+      usage,
+    );
+
+    return { key, salt, iv } as Key;
   } else {
-    if (password.length < algorithm.keyBits / 8) {
-      throw new Error("Key buffer (password) too small");
-    }
-    // prettier-ignore
-    resultKey = await crypto.subtle.importKey("raw", password, id, false, usage);
-    resultSalt = "";
+    // Direct password usage (password IS the key material)
+    // IMPORTANT: Password length MUST match expected key length for the algorithm
+    // This path is generally not recommended for user-provided passwords.
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      passwordBytes,
+      mergedOptions.algorithm.startsWith('aes') ? "AES-CBC" : "HMAC", // Assuming HMAC if not AES
+      true,
+      mergedOptions.algorithm.startsWith('aes') ? ["encrypt", "decrypt"] : ["sign", "verify"],
+    );
+
+    // Generate IV if needed for encryption algorithms
+    const iv = mergedOptions.algorithm.startsWith('aes-')
+      ? ((mergedOptions as EncryptionGenerateKeyOptions).iv
+        ? (typeof (mergedOptions as EncryptionGenerateKeyOptions).iv === 'string' ? base64UrlToBytes((mergedOptions as EncryptionGenerateKeyOptions).iv as string) : (mergedOptions as EncryptionGenerateKeyOptions).iv)
+        : crypto.getRandomValues(new Uint8Array(16))) // Generate 16-byte IV if not provided
+      : undefined;
+
+    // Return the key, an EMPTY salt (as none was used/generated), and IV (if applicable)
+    return { key: cryptoKey, salt: new Uint8Array(0), iv };
   }
-
-  if (options.iv) {
-    resultIV = options.iv;
-  } else if ("ivBits" in algorithm) {
-    resultIV = randomBits(algorithm.ivBits);
-  } else {
-    throw new Error("Missing IV");
-  }
-
-  return <Key>{
-    key: resultKey,
-    salt: resultSalt,
-    iv: resultIV,
-  };
-}
-
-/** Provides an asynchronous Password-Based Key Derivation Function 2 (PBKDF2) implementation. */
-async function pbkdf2(
-  password: string,
-  salt: string,
-  iterations: number,
-  keyLength: number,
-  hash: HashAlgorithmIdentifier,
-): Promise<ArrayBuffer> {
-  const passwordBuffer = textEncoder.encode(password);
-  // prettier-ignore
-  const importedKey = await crypto.subtle.importKey("raw", passwordBuffer, { name: "PBKDF2" }, false, ["deriveBits"]);
-  const saltBuffer = textEncoder.encode(salt);
-  const params = { name: "PBKDF2", hash, salt: saltBuffer, iterations };
-  // prettier-ignore
-  const derivation = await crypto.subtle.deriveBits(params, importedKey, keyLength * 8);
-  return derivation;
 }
 
 // --- encrypt/decrypt ---
 
 export async function encrypt(
   password: Password,
-  options: GenerateKeyOptions<EncryptionAlgorithm>,
+  options: EncryptionGenerateKeyOptions,
+  iv: Uint8Array,
   data: string,
 ): Promise<{ encrypted: Uint8Array; key: Key }> {
   const key = await generateKey(password, options);
   const encrypted = await crypto.subtle.encrypt(
-    ...getEncryptParams(options.algorithm, key, data),
+    // Pass the provided 'iv' parameter explicitly
+    ...getEncryptParams(options.algorithm, key, iv, data),
   );
   return { encrypted: new Uint8Array(encrypted), key };
 }
 
 export async function decrypt(
   password: Password,
-  options: GenerateKeyOptions<EncryptionAlgorithm>,
+  options: EncryptionGenerateKeyOptions,
   data: Uint8Array | string,
 ): Promise<string> {
   const key = await generateKey(password, options);
   const decrypted = await crypto.subtle.decrypt(
-    ...getEncryptParams(options.algorithm, key, data),
+    // Pass the IV explicitly now
+    ...getEncryptParams(options.algorithm, key, options.iv!, data),
   );
   return textDecoder.decode(decrypted);
 }
@@ -291,16 +369,17 @@ export async function decrypt(
 function getEncryptParams(
   algorithm: EncryptionAlgorithm,
   key: Key,
+  iv: Uint8Array,
   data: Uint8Array | string,
 ): [AesCbcParams | AesCtrParams, CryptoKey, Uint8Array] {
   return [
     algorithm === "aes-128-ctr"
-      ? ({
+      ? ({ // Assert non-null for counter and iv below
           name: "AES-CTR",
-          counter: key.iv,
+          counter: iv, // Assert non-null: iv is always generated during encryption
           length: 128,
         } satisfies AesCtrParams)
-      : ({ name: "AES-CBC", iv: key.iv } satisfies AesCbcParams),
+      : ({ name: "AES-CBC", iv } satisfies AesCbcParams),
     key.key,
     typeof data === "string" ? textEncoder.encode(data) : data,
   ];
@@ -318,36 +397,125 @@ function fixedTimeComparison(a: string, b: string): boolean {
 }
 
 /** Normalizes a password parameter. */
-function normalizePassword(password: RawPassword) {
+function normalizePassword(password: RawPassword): NormalizedPassword {
+  let id = "";
+  let encryptionPassword: Password = "";
+  let integrityPassword: Password = "";
+
   if (typeof password === "string" || password instanceof Uint8Array) {
-    return { encryption: password, integrity: password };
+    // Case 1: Simple password string or buffer
+    encryptionPassword = password;
+    integrityPassword = password;
+  } else if ("secret" in password) {
+    // Case 2: Object with 'secret' property (RawPasswordObject or old PasswordSecret)
+    id = password.id || "";
+    encryptionPassword = password.secret;
+    integrityPassword = password.secret;
+  } else if ("encryption" in password && "integrity" in password) {
+    // Case 3: Object with specific 'encryption' and 'integrity' passwords
+    id = password.id || ""; // Handle missing id for this specific type
+    encryptionPassword = password.encryption;
+    integrityPassword = password.integrity;
   }
-  if ("secret" in password) {
-    return {
-      id: password.id,
-      encryption: password.secret,
-      integrity: password.secret,
-    };
-  }
-  return {
-    id: password.id,
-    encryption: password.encryption,
-    integrity: password.integrity,
-  };
+
+  return { id, encryption: encryptionPassword, integrity: integrityPassword };
 }
 
-/** Generate cryptographically strong pseudorandom bits. */
-export function randomBits(bits: number): Uint8Array {
-  if (bits < 1) throw new Error("Invalid random bits count");
-  const bytes = Math.ceil(bits / 8);
-  return randomBytes(bytes);
+/**
+ * @description 加密和签名选项。
+ */
+export type SealOptions = Readonly<{
+  ttl: number;
+  timestampSkewSec: number;
+  localtimeOffsetMsec: number;
+  encryption: EncryptionSealOptions;
+  integrity: IntegritySealOptions;
+}>;
+
+/** Options specific to an encryption algorithm. */
+interface EncryptionSealOptions {
+  saltBits: number;
+  algorithm: EncryptionAlgorithm;
+  iterations: number;
+  minPasswordlength: number;
+  keyBits: number;
+  ivBits: number;
 }
 
-/** Generates cryptographically strong pseudorandom bytes. */
-function randomBytes(size: number): Uint8Array {
-  const bytes = new Uint8Array(size);
-  crypto.getRandomValues(bytes);
-  return bytes;
+/** Options specific to an integrity algorithm. */
+interface IntegritySealOptions {
+  saltBits: number;
+  algorithm: IntegrityAlgorithm;
+  iterations: number;
+  minPasswordlength: number;
+  keyBits: number;
+}
+
+/** Password secret string or buffer.*/
+type Password = Uint8Array | string;
+
+/** Password hash object `{ <id>: <password>, ... }`. */
+type PasswordHash = Record<string, Password | RawPassword>;
+
+/** Password object `{ id: <password id>, secret: <password>, encryption: <encryption options>, integrity: <integrity options>}`. */
+type RawPasswordObject = Readonly<Record<string, unknown>> & {
+  id: string;
+  secret: Password;
+  encryption: EncryptionSealOptions;
+  integrity: IntegritySealOptions;
+};
+
+/** Raw password format. */
+type RawPassword =
+  | Password
+  | RawPasswordObject
+  | Readonly<{ encryption: Password; integrity: Password; id?: string }>;
+
+/** Normalized password object. */
+interface NormalizedPassword extends Readonly<Record<string, unknown>> {
+  id?: string;
+  encryption: Password;
+  integrity: Password;
+}
+
+// --- Key Generation Option Types ---
+
+/** Options specific to encryption keys. */
+export interface EncryptionGenerateKeyOptions {
+  salt?: string | Uint8Array;
+  saltBits: number;
+  iterations: number;
+  minPasswordlength: number;
+  keyBits: number;
+  algorithm: EncryptionAlgorithm;
+  iv?: Uint8Array;
+  ivBits: number;
+}
+
+/** Options specific to integrity keys. */
+export interface IntegrityGenerateKeyOptions {
+  salt?: string | Uint8Array;
+  saltBits: number;
+  iterations: number;
+  minPasswordlength: number;
+  keyBits: number;
+  algorithm: IntegrityAlgorithm;
+}
+
+/** Union type for generateKey function. */
+export type GenerateKeyOptions = EncryptionGenerateKeyOptions | IntegrityGenerateKeyOptions;
+
+/** Generated internal key object. */
+export type Key = Readonly<{
+  key: CryptoKey;
+  salt: Uint8Array;
+  iv?: Uint8Array;
+}>;
+
+/** Generated HMAC internal results. */
+export interface HMacResult {
+  digest: string;
+  salt: string;
 }
 
 // --- Types ---
@@ -361,89 +529,40 @@ export type IntegrityAlgorithm = "sha256";
 /** @internal */
 type _Algorithm = EncryptionAlgorithm | IntegrityAlgorithm;
 
+// --- Utility Helpers ---
+
 /**
- * Options for customizing the key derivation algorithm used to generate encryption and integrity verification keys as well as the algorithms and salt sizes used.
+ * Converts a Uint8Array to a base64url encoded string.
+ * @param bytes The byte array to encode.
+ * @returns The base64url encoded string.
  */
-export type SealOptions = Readonly<{
-  /** Encryption step options. */
-  encryption: SealOptionsSub<EncryptionAlgorithm>;
+function bytesToBase64Url(bytes: Uint8Array): string {
+  // Standard base64 encoding
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const base64 = btoa(binary);
+  // Make it URL-safe
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
-  /** Integrity step options. */
-  integrity: SealOptionsSub<IntegrityAlgorithm>;
-
-  /*Sealed object lifetime in milliseconds where 0 means forever. Defaults to 0. */
-  ttl: number;
-
-  /** Number of seconds of permitted clock skew for incoming expirations. Defaults to 60 seconds. */
-  timestampSkewSec: number;
-
-  /**
-   * Local clock time offset, expressed in number of milliseconds (positive or negative). Defaults to 0.
-   */
-  localtimeOffsetMsec: number;
-}>;
-
-/** `seal()` method options. */
-type SealOptionsSub<Algorithm extends _Algorithm = _Algorithm> = Readonly<{
-  /** The length of the salt (random buffer used to ensure that two identical objects will generate a different encrypted result). Defaults to 256. */
-  saltBits: number;
-
-  /** The algorithm used. Defaults to 'aes-256-cbc' for encryption and 'sha256' for integrity. */
-  algorithm: Algorithm;
-
-  /** The number of iterations used to derive a key from the password. Defaults to 1. */
-  iterations: number;
-
-  /** Minimum password size. Defaults to 32. */
-  minPasswordlength: number;
-}>;
-
-/** Password secret string or buffer.*/
-type Password = Uint8Array | string;
-
-/** `generateKey()` method options. */
-export type GenerateKeyOptions<Algorithm extends _Algorithm = _Algorithm> =
-  Pick<
-    SealOptionsSub<Algorithm>,
-    "algorithm" | "iterations" | "minPasswordlength"
-  > &
-    Readonly<{
-      saltBits?: number | undefined;
-      salt?: string | undefined;
-      iv?: Uint8Array | undefined;
-      ivBits?: number | undefined;
-      hmac?: boolean | undefined;
-    }>;
-
-/** Generated internal key object. */
-type Key = Readonly<{
-  key: CryptoKey;
-  salt: string;
-  iv: Uint8Array;
-}>;
-
-/** Generated HMAC internal results. */
-type HMacResult = Readonly<{
-  digest: string;
-  salt: string;
-}>;
-
-/** Secret object with optional id.*/
-type PasswordSecret = Readonly<{
-  id?: string | undefined;
-  secret: Password;
-}>;
-
-/** Secret object with optional id and specified password for each encryption and integrity. */
-type PasswordSpecific = Readonly<{
-  id?: string | undefined;
-  encryption: Password;
-  integrity: Password;
-}>;
-
-/** Key-value pairs hash of password id to value. */
-type PasswordHash = Readonly<
-  Record<string, Password | PasswordSecret | PasswordSpecific>
->;
-
-export type RawPassword = Password | PasswordSecret | PasswordSpecific;
+/**
+ * Converts a base64url encoded string to a Uint8Array.
+ * @param base64url The base64url encoded string.
+ * @returns The decoded Uint8Array.
+ */
+function base64UrlToBytes(base64url: string): Uint8Array {
+  // Add padding back if necessary
+  base64url = base64url.padEnd(base64url.length + (4 - (base64url.length % 4)) % 4, '=');
+  // Convert base64url to standard base64
+  const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+  // Decode base64
+  const binStr = atob(base64);
+  const bytes = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i++) {
+    bytes[i] = binStr.charCodeAt(i);
+  }
+  return bytes;
+}
